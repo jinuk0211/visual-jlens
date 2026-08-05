@@ -73,6 +73,65 @@ reference implementation and is not optimized; fitting time is dominated by
 the model's own backward pass. Parallelize by running `fit()` on disjoint
 slices and combining with `JacobianLens.merge()`.
 
+### Multimodal fit (Gemma 4 / Qwen3-VL)
+
+The multimodal path fits two separate decoder-residual lenses:
+
+- `image_to_answer`: fused image-token positions to assistant-answer positions
+- `prompt_to_answer`: user-text positions to assistant-answer positions
+
+It records the input to each decoder block rather than the preceding block's
+raw output. This matters for Qwen3-VL because its early DeepStack additions
+happen between decoder blocks. Gemma 4 12B Unified is handled by a separate,
+encoder-free adapter that preserves its visual bidirectional attention masks.
+
+First create the pinned 1,000-fit/200-eval The Cauldron manifest. The manifest
+contains dataset provenance and image hashes, not image bytes:
+
+```bash
+python scripts/prepare_cauldron.py out/cauldron.jsonl --seed 0
+```
+
+Run a 32-example pilot, then the full fit. Both commands are resumable when
+re-run with the same output directory:
+
+```bash
+python scripts/fit_multimodal.py \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --manifest out/cauldron.jsonl \
+  --output-dir out/qwen3-vl-pilot --limit 32
+
+python scripts/fit_multimodal.py \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --manifest out/cauldron.jsonl \
+  --output-dir out/qwen3-vl
+```
+
+Use `google/gemma-4-12B-it` for the Gemma run. Install the `vlm` extra with
+`pip install -e '.[vlm]'`; this selects a Transformers release with
+`AutoModelForMultimodalLM` and Gemma 4 Unified support.
+Fitting defaults to BF16 weights, four Rademacher probes per example, and an
+automatically selected probe microbatch of 4, 2, or 1. Unlike the exact
+text-only fitter, this costs one forward/backward per probe microbatch rather
+than one backward per hidden dimension.
+
+The result is written to `OUTPUT_DIR/lens/` as sharded FP16 safetensors plus a
+JSON manifest. Held-out evaluation, including optional gray-image and
+image-swap controls, is available with:
+
+```bash
+python scripts/evaluate_multimodal.py \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --lens out/qwen3-vl/lens \
+  --manifest out/cauldron.jsonl \
+  --output out/qwen3-vl-eval.jsonl --controls
+
+python scripts/report_multimodal.py \
+  --eval out/qwen3-vl-eval.jsonl \
+  --lens out/qwen3-vl/lens \
+  --output-dir out/qwen3-vl-report
+```
+
 ## Walkthrough
 
 [`walkthrough.ipynb`](walkthrough.ipynb) is the end-to-end notebook: load a

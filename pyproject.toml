@@ -14,6 +14,7 @@ dependencies = [
     "huggingface_hub",
     "transformers>=5.5",
     "numpy",
+    "safetensors",
 ]
 
 [project.urls]
@@ -21,7 +22,8 @@ Repository = "https://github.com/anthropics/jacobian-lens"
 Paper = "https://transformer-circuits.pub/2026/workspace/index.html"
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "datasets"]
+dev = ["pytest", "ruff", "datasets", "pillow"]
+vlm = ["transformers>=5.14.1", "datasets", "pillow"]
 
 [tool.ruff]
 line-length = 88
