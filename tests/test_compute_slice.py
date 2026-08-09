@@ -87,6 +87,21 @@ def test_layer_list_strides_but_keeps_last_fitted_and_final(model, lens):
     assert sd.layers == [0, 2, 3]  # fitted [0, 1, 2] strided, plus the final layer
 
 
+def test_position_chunking_matches_non_chunked(model, lens):
+    chunked = compute_slice(model, lens, PROMPT, top_n=5, position_chunk_size=7)
+    whole = compute_slice(model, lens, PROMPT, top_n=5, position_chunk_size=None)
+    assert chunked.layers == whole.layers
+    assert chunked.tracked_token_ids == whole.tracked_token_ids
+    np.testing.assert_array_equal(chunked.top_ids, whole.top_ids)
+    np.testing.assert_array_equal(chunked.top_ranks, whole.top_ranks)
+    np.testing.assert_array_equal(chunked.rank_tensor, whole.rank_tensor)
+
+
+def test_position_chunk_size_must_be_positive(model, lens):
+    with pytest.raises(ValueError, match="position_chunk_size"):
+        compute_slice(model, lens, PROMPT, position_chunk_size=0)
+
+
 def test_pinned_token_ids_flow_to_the_page_by_default(model, lens, tmp_path):
     pin = int(model.encode(PROMPT)[0, 3])
     sd = compute_slice(model, lens, PROMPT, pinned_token_ids={pin})

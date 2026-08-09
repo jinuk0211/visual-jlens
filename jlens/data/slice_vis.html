@@ -64,6 +64,13 @@ body{margin:8px}
 .tokens-area{flex:none;font:11px/1.5 monospace;height:5.2em;overflow-y:auto;padding:2px;
              white-space:pre-wrap;word-break:break-all}
 .token{cursor:pointer;border-radius:2px}.token:hover{background:var(--hl-soft)}
+.token[data-segment-kind="system"]{border-bottom:2px solid #8b5cf6}
+.token[data-segment-kind="user"]{border-bottom:2px solid #2563eb}
+.token[data-segment-kind="assistant"]{border-bottom:2px solid #059669}
+.token[data-segment-kind="scratchpad"]{border-bottom:2px solid #d97706}
+.token[data-segment-kind="tool-name"]{border-bottom:2px solid #dc2626}
+.token[data-segment-kind="arguments"]{border-bottom:2px solid #db2777}
+.token[data-segment-kind="tool-result"]{border-bottom:2px solid #0891b2}
 .token-prefix{color:#bbb;border-radius:2px}
 .token.selected{background:var(--hl-soft);outline:1px solid var(--hl)}
 .meta-line{font-size:10px;color:#999;padding:2px 0}
@@ -191,6 +198,10 @@ const tidIdx = new Map(tracked.map((t, i) => [t, i]));
 const layerIdx = new Map(layers.map((l, i) => [l, i]));
 const at = (arr, t, l, k) => arr[(t * L + l) * topN + k];
 const vocab = D.vocab, altToken = D.alt_token || {};
+const segments = D.segments || [];
+const segmentAt = pos => segments
+  .filter(s => pos >= s.start && pos < s.end)
+  .sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
 const tokStr = tid => vocab[String(tid)] ?? `[${tid}]`;
 const argmax = []; // [T][L]
 for (let t = 0; t < T; t++) { argmax[t] = []; for (let l = 0; l < L; l++) argmax[t][l] = at(D.top_ids, t, l, 0); }
@@ -294,7 +305,7 @@ const tooltip = document.getElementById('tt');
 main.innerHTML = `
 <div class="column heatmap-column" id="col0">
   <div class="controls-bar">
-    <span class="readout">Pos <b id="ctxLabel"></b><code id="ctxTok"></code> Layer <b id="layerLabel"></b></span>
+    <span class="readout">Pos <b id="ctxLabel"></b><code id="ctxTok"></code> Layer <b id="layerLabel"></b> <code id="segmentLabel"></code></span>
     <label class="ws-row"><input type="checkbox" id="wsChk"> whitespace</label>
     <span class="hint">hold ⇧ to scrub · ←→ pos · ↑↓ layer</span>
   </div>
@@ -435,7 +446,8 @@ function showTT(e, t, li) {
     const tid = at(D.top_ids, t, li, k), r = at(D.top_ranks, t, li, k);
     rows.push(`<tr><td class="tt-rank">${r}</td><td class="tt-token${pinned.has(tid) ? ' pinned' : ''}">${esc(clean(tid).text)}</td></tr>`);
   }
-  tooltip.innerHTML = `<div class="tt-header">Pos=${OFF + t} Layer=${layers[li]}</div><table class="tt-table">${rows.join('')}</table>`;
+  const seg = segmentAt(OFF + t);
+  tooltip.innerHTML = `<div class="tt-header">Pos=${OFF + t} Layer=${layers[li]}${seg ? ` · ${esc(seg.label || seg.kind)}` : ''}</div><table class="tt-table">${rows.join('')}</table>`;
   tooltip.classList.add('visible'); moveTT(e);
 }
 function moveTT(e) { const bb = tooltip.getBoundingClientRect(); tooltip.style.left = Math.min(innerWidth - bb.width - 8, e.clientX + 12) + 'px'; tooltip.style.top = Math.max(4, e.clientY - bb.height - 8) + 'px'; }
@@ -444,7 +456,15 @@ function moveTT(e) { const bb = tooltip.getBoundingClientRect(); tooltip.style.l
 const toksDiv = document.getElementById('tokens');
 // Un-sliced prefix (last_n_tokens pages): shown for context, not interactive.
 D.prefix_strs.forEach(s => { const sp = document.createElement('span'); sp.className = 'token-prefix'; sp.textContent = s; toksDiv.appendChild(sp); });
-const tokSpans = D.ctx_strs.map((s, i) => { const sp = document.createElement('span'); sp.className = 'token'; sp.textContent = s; sp.onclick = () => { selCtx = i; render(); }; sp.onmouseenter = e => { if (e.shiftKey) { selCtx = i; render(); } }; toksDiv.appendChild(sp); return sp; });
+const tokSpans = D.ctx_strs.map((s, i) => {
+  const sp = document.createElement('span');
+  const seg = segmentAt(OFF + i);
+  sp.className = 'token'; sp.textContent = s;
+  if (seg) { sp.dataset.segmentKind = seg.kind || ''; sp.title = seg.label || seg.kind || ''; }
+  sp.onclick = () => { selCtx = i; render(); };
+  sp.onmouseenter = e => { if (e.shiftKey) { selCtx = i; render(); } };
+  toksDiv.appendChild(sp); return sp;
+});
 
 // ------- whitespace toggle -------
 const wsChk = document.getElementById('wsChk'); wsChk.checked = showWs;
@@ -717,6 +737,8 @@ function render() {
   document.getElementById('ctxLabel').textContent = OFF + selCtx;
   document.getElementById('ctxTok').textContent = (D.ctx_strs[selCtx] || '').replace(/\n/g, '⏎');
   document.getElementById('layerLabel').textContent = selLayer;
+  const activeSegment = segmentAt(OFF + selCtx);
+  document.getElementById('segmentLabel').textContent = activeSegment ? (activeSegment.label || activeSegment.kind) : '';
   document.getElementById('byLayerH').textContent = `By Layer (Pos=${OFF + selCtx} ${(D.ctx_strs[selCtx] || '').replace(/\n/g, '⏎')})`;
   document.getElementById('byCtxH').textContent = `By Pos (Layer=${selLayer})`;
 

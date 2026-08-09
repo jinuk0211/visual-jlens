@@ -88,6 +88,22 @@ def test_fetch_mode_writes_sidecars(tmp_path):
     assert payload > 0
 
 
+def test_position_segments_flow_to_metadata(tmp_path):
+    sd = _synthetic_slice()
+    segments = [{"start": 1, "end": 3, "kind": "tool-name", "label": "tool"}]
+    build_page(
+        sd,
+        "p",
+        title="T",
+        description="d",
+        mode="fetch",
+        out_dir=tmp_path,
+        position_segments=segments,
+    )
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    assert meta["segments"] == segments
+
+
 def test_embed_mode_raises_when_d3_fetch_fails(monkeypatch):
     monkeypatch.delitem(vis._TEMPLATE_FOR_MODE, "embed", raising=False)
 
