@@ -76,7 +76,8 @@ uv run python scripts/analyze_tau2.py \
   --event-before all \
   --event-after 1 \
   --layer-stride 4 \
-  --last-n-tokens 96 \
+  --top-k 10 \
+  --last-n-tokens 0 \
   --max-seq-len 32768
 ```
 
@@ -132,8 +133,10 @@ listed in `analysis_report.json`.
 - `analysis_report.json` records per-call success, errors, and visualization
   paths.
 - Each per-call directory contains an interactive Jacobian-lens slice including
-  the logged assistant response. `--last-n-tokens 0` renders every position;
-  this only changes the HTML grid, not semantic-boundary CSV computation.
+  the logged assistant response. `--last-n-tokens 0` renders every position,
+  and `--top-k K` stores the top K lens tokens for every rendered
+  position/layer cell. These options only change the HTML grid, not
+  semantic-boundary CSV computation.
 
 Useful diagnostic patterns:
 

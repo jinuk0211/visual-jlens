@@ -88,6 +88,17 @@ def test_fetch_mode_writes_sidecars(tmp_path):
     assert payload > 0
 
 
+def test_page_draws_every_top_k_candidate():
+    sd = _synthetic_slice(top_n=5)
+    page, _, _ = build_page(
+        sd, "p", title="T", description="d", pinned_token_ids=set(), mode="embed"
+    )
+    assert "Every cell shows #1–#${topN}" in page
+    assert "for (let k = 0; k < topN; k++)" in page
+    assert "at(D.top_ids, t, li, k)" in page
+    assert "#${r + 1}" in page
+
+
 def test_position_segments_flow_to_metadata(tmp_path):
     sd = _synthetic_slice()
     segments = [{"start": 1, "end": 3, "kind": "tool-name", "label": "tool"}]

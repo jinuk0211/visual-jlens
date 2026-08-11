@@ -1,4 +1,5 @@
 import json
+import sys
 
 import torch
 
@@ -6,6 +7,7 @@ from jlens.tau2 import LoggedCall, Tau2Case
 from scripts.analyze_tau2 import (
     SelectedCall,
     build_manifest,
+    parse_args,
     score_generated_spans,
     score_semantic_boundaries,
 )
@@ -15,6 +17,27 @@ from tests.test_tau2 import FakeTokenizer, sample_call
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_parse_args_accepts_all_token_top_k(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "analyze_tau2.py",
+            "--run-dir",
+            str(tmp_path),
+            "--top-k",
+            "10",
+            "--last-n-tokens",
+            "0",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.top_k == 10
+    assert args.last_n_tokens == 0
 
 
 def test_build_manifest_reports_missing_and_selected_logs(tmp_path):

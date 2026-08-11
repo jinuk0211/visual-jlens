@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Slice visualisation for the Jacobian lens.
 
-Produces an interactive HTML page per prompt: a position x layer heatmap of
-the lens top-1 token with rank overlays and per-token rank-tracking charts.
+Produces an interactive HTML page per prompt: a position x layer grid of the
+lens top-K tokens with rank labels and per-token rank-tracking charts.
 Data ships as gzip'd typed-array bytes, either base64-embedded inline (single
 self-contained file, d3 inlined too) or as ``slice.bin`` / ``meta.json`` /
 ``ranks/{tid}.bin`` sidecars for static hosting.

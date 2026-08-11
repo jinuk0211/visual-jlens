@@ -59,6 +59,8 @@ body{margin:8px}
 .readout b{display:inline-block;width:2.4ch;color:#000;font-weight:600}
 .readout code{display:inline-block;width:9ch;overflow:hidden;text-overflow:ellipsis;
               white-space:nowrap;vertical-align:bottom;font:11px monospace;color:#000}
+.topk-legend{font-size:10px;color:#277da1;background:#e8f5fb;border:1px solid #b9e1f2;
+             border-radius:999px;padding:1px 7px;white-space:nowrap}
 .hint{font-size:10px;color:#bbb;white-space:nowrap;margin-left:auto}
 .bottom-controls{flex:none;border-top:1px solid var(--bd);padding-top:2px}
 .tokens-area{flex:none;font:11px/1.5 monospace;height:5.2em;overflow-y:auto;padding:2px;
@@ -306,6 +308,7 @@ main.innerHTML = `
 <div class="column heatmap-column" id="col0">
   <div class="controls-bar">
     <span class="readout">Pos <b id="ctxLabel"></b><code id="ctxTok"></code> Layer <b id="layerLabel"></b> <code id="segmentLabel"></code></span>
+    <span class="topk-legend">Every cell shows #1–#${topN}</span>
     <label class="ws-row"><input type="checkbox" id="wsChk"> whitespace</label>
     <span class="hint">hold ⇧ to scrub · ←→ pos · ↑↓ layer</span>
   </div>
@@ -336,16 +339,17 @@ main.innerHTML = `
 document.getElementById('meta').textContent =
   `${D.title || ''}  ·  ${T} positions × ${L} layers  ·  top-${topN}`;
 
-// ------- argmax heatmap (column-virtualized canvas) -------
+// ------- position × layer top-k grid (column-virtualized canvas) -------
 // A scrollable spacer sized to (T*CELL_W) × (L*CELL_H + foot) gives a real
 // scrollbar; a viewport-sized canvas is `position:sticky left:0` so it stays
 // put while the spacer scrolls under it. Only the visible column range is
-// drawn — paint cost is O(L × visibleCols), independent of T. Selection +
+// drawn — paint cost is O(L × topN × visibleCols), independent of T. Selection +
 // hover are absolutely-positioned outline divs on the spacer (so they scroll
 // with content). Pinned-token highlighting and showWs are handled by repaint.
 const hmWrap = document.getElementById('hm-wrap');
-const CELL_W = 56, CELL_H = 14, YAX_W = 28, XAX_H = 32;
-const HM_FONT = '9px monospace', HM_RANK_FONT = '7px monospace';
+const K_LINE_H = 15;
+const CELL_W = 120, CELL_H = Math.max(24, topN * K_LINE_H + 6), YAX_W = 34, XAX_H = 32;
+const HM_FONT = '10px monospace', HM_RANK_FONT = '9px monospace';
 const totalW = YAX_W + T * CELL_W, totalH = L * CELL_H + XAX_H;
 hmWrap.innerHTML = `
   <div class="hm-spacer" style="width:${totalW}px;height:${totalH}px">
@@ -384,18 +388,24 @@ function hmRepaint(force = false) {
   for (let t = c0; t < c1; t++) {
     const x = YAX_W + t * CELL_W - sx;
     for (let li = L - 1; li >= 0; li--) {
-      const y = (L - 1 - li) * CELL_H, tid = argmax[t][li];
-      const r = at(D.top_ranks, t, li, 0);
-      const pin = pinned.get(tid);
-      if (pin) { hmCtx.fillStyle = pin + '20'; hmCtx.fillRect(x, y, CELL_W, CELL_H); }
+      const y = (L - 1 - li) * CELL_H;
+      hmCtx.fillStyle = '#fff'; hmCtx.fillRect(x, y, CELL_W, CELL_H);
       hmCtx.strokeStyle = '#eee'; hmCtx.strokeRect(x + .5, y + .5, CELL_W - 1, CELL_H - 1);
-      hmCtx.font = HM_FONT;
-      hmCtx.fillStyle = pin || (r > 0 ? '#888' : '#000');
-      const txt = clean(tid).text;
-      hmCtx.fillText(txt.length > 9 ? txt.slice(0, 8) + '…' : txt, x + 3, y + CELL_H / 2, CELL_W - 6);
-      if (r > 0) {
-        hmCtx.font = HM_RANK_FONT; hmCtx.fillStyle = '#b00';
-        hmCtx.fillText(String(r), x + CELL_W - 10, y + 4);
+      for (let k = 0; k < topN; k++) {
+        const tid = at(D.top_ids, t, li, k), r = at(D.top_ranks, t, li, k);
+        const pin = pinned.get(tid), lineY = y + 3 + k * K_LINE_H;
+        if (pin || k === 0) {
+          hmCtx.fillStyle = pin ? pin + '20' : '#e8f5fb';
+          hmCtx.fillRect(x + 1, lineY, CELL_W - 2, K_LINE_H);
+        }
+        hmCtx.font = HM_RANK_FONT;
+        hmCtx.fillStyle = k === 0 ? '#087ca7' : '#8a9ba3';
+        hmCtx.fillText(`#${r + 1}`, x + 4, lineY + K_LINE_H / 2, 22);
+        hmCtx.font = HM_FONT;
+        hmCtx.fillStyle = pin || (k === 0 ? '#102a43' : '#52606d');
+        const txt = clean(tid).text;
+        hmCtx.fillText(txt.length > 14 ? txt.slice(0, 13) + '…' : txt,
+                       x + 29, lineY + K_LINE_H / 2, CELL_W - 33);
       }
     }
   }
@@ -444,7 +454,7 @@ function showTT(e, t, li) {
   const rows = [];
   for (let k = 0; k < topN; k++) {
     const tid = at(D.top_ids, t, li, k), r = at(D.top_ranks, t, li, k);
-    rows.push(`<tr><td class="tt-rank">${r}</td><td class="tt-token${pinned.has(tid) ? ' pinned' : ''}">${esc(clean(tid).text)}</td></tr>`);
+    rows.push(`<tr><td class="tt-rank">#${r + 1}</td><td class="tt-token${pinned.has(tid) ? ' pinned' : ''}">${esc(clean(tid).text)}</td></tr>`);
   }
   const seg = segmentAt(OFF + t);
   tooltip.innerHTML = `<div class="tt-header">Pos=${OFF + t} Layer=${layers[li]}${seg ? ` · ${esc(seg.label || seg.kind)}` : ''}</div><table class="tt-table">${rows.join('')}</table>`;
@@ -706,7 +716,7 @@ function render() {
   const li = selLI();
   const sKey = [...pinned.entries()].map(([t, c]) => t + c).join(',') + '|' + showWs;
 
-  // argmax heatmap: pinned/ws changes → repaint visible columns only
+  // top-k grid: pinned/ws changes → repaint visible columns only
   if (sKey !== lastKey.hm) { hmRepaint(true); lastKey.hm = sKey; }
   hmPlaceSel();
   hmScrollTo(selCtx);
