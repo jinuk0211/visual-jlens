@@ -73,6 +73,41 @@ class MappingTokenizer(FakeTokenizer):
         return {"input_ids": value} if kwargs.get("tokenize") else value
 
 
+class MergedToolNameTokenizer(FakeTokenizer):
+    """Emit an exact template token that crosses into the tool-name text."""
+
+    def __init__(self):
+        self.piece_ids = {}
+        self.id_pieces = {}
+
+    def apply_chat_template(self, *args, **kwargs):
+        rendered = super().apply_chat_template(*args, **{**kwargs, "tokenize": False})
+        if not kwargs.get("tokenize"):
+            return rendered
+        marker = '"name":"'
+        marker_start = rendered.rfind(marker)
+        if marker_start < 0:
+            return self.encode(rendered)
+        merged_end = marker_start + len(marker) + 1
+        merged_piece = rendered[marker_start:merged_end]
+        merged_id = self.piece_ids.setdefault(
+            merged_piece, 1_000_000 + len(self.piece_ids)
+        )
+        self.id_pieces[merged_id] = merged_piece
+        return [
+            *self.encode(rendered[:marker_start]),
+            merged_id,
+            *self.encode(rendered[merged_end:]),
+        ]
+
+    def decode(self, token_ids, **kwargs):
+        del kwargs
+        return "".join(
+            self.id_pieces.get(token_id, chr(token_id))
+            for token_id in token_ids
+        )
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -202,6 +237,33 @@ def test_normalize_messages_restores_logged_multiline_content():
     assert messages[0]["content"] == ["policy line 1", "line 2"]
 
 
+def test_normalize_messages_deserializes_historical_tool_arguments():
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_user_details",
+                        "arguments": '{"user_id": "123"}',
+                    },
+                }
+            ],
+        }
+    ]
+
+    normalized = normalize_messages(messages)
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
+        "user_id": "123"
+    }
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == (
+        '{"user_id": "123"}'
+    )
+
+
 def test_render_and_tool_candidate_use_the_chat_template():
     tokenizer = FakeTokenizer()
     call = sample_call()
@@ -254,6 +316,28 @@ def test_render_actual_response_locates_semantic_boundaries_and_arguments():
     for span in replay.generated_spans:
         assert replay.response.token_ids[span.start : span.end] == span.token_ids
         assert len(span.prediction_positions) == len(span.token_ids)
+
+
+def test_response_and_candidate_keep_merged_bpe_tool_name_token():
+    tokenizer = MergedToolNameTokenizer()
+
+    replay = render_actual_response(tokenizer, sample_call(), enable_thinking=False)
+    response_name = replay.generated_spans[0]
+    candidate = build_tool_candidate(
+        tokenizer,
+        sample_call(),
+        "cancel_reservation",
+        enable_thinking=False,
+    )
+
+    assert response_name.token_ids[0] >= 1_000_000
+    assert candidate.name_token_ids[0] >= 1_000_000
+    assert replay.response.token_ids[response_name.start : response_name.end] == (
+        response_name.token_ids
+    )
+    assert candidate.token_ids[
+        candidate.name_start : candidate.name_start + len(candidate.name_token_ids)
+    ] == candidate.name_token_ids
 
 
 def test_infer_first_error_prefers_verified_schema_error_and_selects_history(tmp_path):
