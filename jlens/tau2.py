@@ -681,8 +681,19 @@ def normalize_messages(messages: Sequence[Mapping[str, Any]]) -> list[JSONDict]:
         value = copy.deepcopy(dict(message))
         if isinstance(value.get("content"), list):
             value["content"] = "\n".join(str(line) for line in value["content"])
+        # The GPT-OSS Harmony template checks for key presence before indexing
+        # ``tool_calls[0]`` and before searching assistant content.  OpenAI logs
+        # commonly retain these optional keys with null/empty values, which is
+        # semantically equivalent to omitting them but crashes that template.
+        if value.get("role") == "assistant":
+            if value.get("content") is None:
+                value.pop("content", None)
+            if value.get("thinking") is None:
+                value.pop("thinking", None)
         tool_calls = value.get("tool_calls")
-        if isinstance(tool_calls, list):
+        if not isinstance(tool_calls, list) or not tool_calls:
+            value.pop("tool_calls", None)
+        else:
             for tool_call in tool_calls:
                 if not isinstance(tool_call, dict):
                     continue
@@ -767,10 +778,9 @@ def _response_message(call: Mapping[str, Any]) -> JSONDict:
     response = call.get("response") or {}
     if not isinstance(response, Mapping):
         raise ValueError("logged response is not a JSON object")
-    message: JSONDict = {
-        "role": "assistant",
-        "content": copy.deepcopy(response.get("content")),
-    }
+    message: JSONDict = {"role": "assistant"}
+    if response.get("content") is not None:
+        message["content"] = copy.deepcopy(response["content"])
     normalized_calls: list[JSONDict] = []
     for tool_call in response.get("tool_calls") or []:
         if not isinstance(tool_call, Mapping):
@@ -1079,7 +1089,6 @@ def build_tool_candidate(
     messages = normalize_messages(request.get("messages") or [])
     candidate_message = {
         "role": "assistant",
-        "content": None,
         "tool_calls": [
             {
                 "type": "function",

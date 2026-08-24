@@ -264,6 +264,22 @@ def test_normalize_messages_deserializes_historical_tool_arguments():
     )
 
 
+def test_normalize_messages_omits_null_harmony_optional_fields():
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": None},
+        {"role": "assistant", "content": None, "tool_calls": []},
+    ]
+
+    normalized = normalize_messages(messages)
+
+    assert normalized == [{"role": "assistant"}, {"role": "assistant"}]
+    assert messages[0] == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": None,
+    }
+
+
 def test_render_and_tool_candidate_use_the_chat_template():
     tokenizer = FakeTokenizer()
     call = sample_call()
@@ -286,6 +302,24 @@ def test_render_and_tool_candidate_use_the_chat_template():
     assert candidate.prediction_positions == tuple(
         range(candidate.name_start - 1, name_end - 1)
     )
+
+
+def test_tool_candidate_omits_null_content_for_harmony_templates():
+    class StrictHarmonyTokenizer(FakeTokenizer):
+        def apply_chat_template(self, conversation, **kwargs):
+            for message in conversation:
+                if message.get("role") == "assistant" and "content" in message:
+                    assert message["content"] is not None
+            return super().apply_chat_template(conversation, **kwargs)
+
+    candidate = build_tool_candidate(
+        StrictHarmonyTokenizer(),
+        sample_call(),
+        "cancel_reservation",
+        enable_thinking=False,
+    )
+
+    assert candidate.name == "cancel_reservation"
 
 
 def test_render_accepts_transformers_five_batch_encoding_shape():
