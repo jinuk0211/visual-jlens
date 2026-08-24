@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Slice visualisation for the Jacobian lens.
 
-Produces an interactive HTML page per prompt: a position x layer heatmap of
-the lens top-1 token with rank overlays and per-token rank-tracking charts.
+Produces an interactive HTML page per prompt: a position x layer grid of the
+lens top-K tokens with rank labels and per-token rank-tracking charts.
 Data ships as gzip'd typed-array bytes, either base64-embedded inline (single
 self-contained file, d3 inlined too) or as ``slice.bin`` / ``meta.json`` /
 ``ranks/{tid}.bin`` sidecars for static hosting.
@@ -203,6 +203,7 @@ def compute_slice(
     last_n_tokens: int | None = None,
     max_seq_len: int = 512,
     mask_display: bool = False,
+    position_chunk_size: int | None = 128,
 ) -> SliceData:
     """Compute the position x layer lens slice for ``prompt``.
 
@@ -223,6 +224,10 @@ def compute_slice(
             shows the whole prompt and labels positions with their absolute
             indices. ``None`` (default) renders every position.
         max_seq_len: Truncate the prompt to this many tokens.
+        position_chunk_size: Number of sequence positions to unembed at once.
+            ``None`` computes a whole layer at once. Chunking preserves every
+            position while keeping the peak vocabulary-logit allocation at
+            ``position_chunk_size x vocab_size``.
     """
     tokenizer = model.tokenizer
     pinned_token_ids = set(pinned_token_ids or ())
@@ -252,12 +257,22 @@ def compute_slice(
         model.forward(input_ids)
         activations = {layer: recorder.activations[layer].detach() for layer in layers}
 
-    def lens_logits(layer: int) -> torch.Tensor:
+    if position_chunk_size is not None and position_chunk_size <= 0:
+        raise ValueError("position_chunk_size must be positive or None")
+
+    def lens_residual(layer: int) -> torch.Tensor:
         residual = activations[layer][0, start:].float()
         if layer in lens.jacobians:
             residual = lens.transport(residual, layer)
         # else: layer == final_layer, J = I -> this row is the model's output.
-        return model.unembed(residual).float().detach()  # [seq_len, vocab_size]
+        return residual
+
+    def position_chunks(residual: torch.Tensor):
+        chunk_size = position_chunk_size or seq_len
+        for pos_start in range(0, seq_len, chunk_size):
+            pos_end = min(seq_len, pos_start + chunk_size)
+            logits = model.unembed(residual[pos_start:pos_end]).float().detach()
+            yield pos_start, pos_end, logits
 
     n_layers = len(layers)
     top_ids = np.zeros((seq_len, n_layers, top_n), dtype=np.int32)
@@ -268,26 +283,36 @@ def compute_slice(
     # Pass 1: per-layer top-K. Logits are not retained across layers (they
     # would dominate memory at long seq_len x large vocab x n_layers).
     for layer_idx, layer in enumerate(layers):
-        logits = lens_logits(layer)
-        vocab_size = int(logits.shape[-1])
+        residual = lens_residual(layer)
+        for pos_start, pos_end, logits in position_chunks(residual):
+            vocab_size = int(logits.shape[-1])
+            if top_n > vocab_size:
+                raise ValueError(f"top_n={top_n} exceeds vocab size {vocab_size}")
 
-        if not mask_display:
-            top_idx = logits.topk(top_n, dim=-1).indices
-            top_ids[:, layer_idx] = top_idx.cpu().numpy()
-            top_ranks[:, layer_idx] = np.arange(top_n, dtype=np.int32)
-        else:
-            if display_mask is None:
-                display_mask = _meaningful_token_mask(
-                    tokenizer, vocab_size, logits.device
+            if not mask_display:
+                top_idx = logits.topk(top_n, dim=-1).indices
+                top_ids[pos_start:pos_end, layer_idx] = top_idx.cpu().numpy()
+                top_ranks[pos_start:pos_end, layer_idx] = np.arange(
+                    top_n, dtype=np.int32
                 )
-            top_idx = (
-                logits.masked_fill(~display_mask, float("-inf"))
-                .topk(top_n, dim=-1)
-                .indices
-            )
-            top_ids[:, layer_idx] = top_idx.cpu().numpy()
-            top_ranks[:, layer_idx] = _ranks_of(logits, top_idx).cpu().numpy()
-        del logits
+            else:
+                if display_mask is None:
+                    display_mask = _meaningful_token_mask(
+                        tokenizer, vocab_size, logits.device
+                    )
+                mask = display_mask
+                assert mask is not None
+                top_idx = (
+                    logits.masked_fill(~mask, float("-inf"))
+                    .topk(top_n, dim=-1)
+                    .indices
+                )
+                top_ids[pos_start:pos_end, layer_idx] = top_idx.cpu().numpy()
+                top_ranks[pos_start:pos_end, layer_idx] = (
+                    _ranks_of(logits, top_idx).cpu().numpy()
+                )
+            del logits
+        del residual
 
     # Choose tracked tokens: pinned + most-frequently-high-ranked in the top-N grid.
     flat_ids = top_ids.ravel()
@@ -306,11 +331,13 @@ def compute_slice(
     if tracked:
         tracked_tensor = torch.tensor(tracked, dtype=torch.long)
         for layer_idx, layer in enumerate(layers):
-            logits = lens_logits(layer)
-            rank_tensor[:, layer_idx] = (
-                _ranks_of(logits, tracked_tensor.to(logits.device)).cpu().numpy()
-            )
-            del logits
+            residual = lens_residual(layer)
+            for pos_start, pos_end, logits in position_chunks(residual):
+                rank_tensor[pos_start:pos_end, layer_idx] = (
+                    _ranks_of(logits, tracked_tensor.to(logits.device)).cpu().numpy()
+                )
+                del logits
+            del residual
 
     vocab_ids = (
         set(int(t) for t in np.unique(flat_ids)) | set(tracked) | set(context_token_ids)
@@ -350,6 +377,7 @@ def _slice_meta(
     description: str,
     pinned_token_ids: set[int] | None,
     alt_token: dict[int, str] | None = None,
+    position_segments: list[dict[str, object]] | None = None,
 ) -> dict:
     """Everything the page needs that isn't the per-cell ``(ctx, layer, token)``
     grid: context strings, layer list, vocab fragment, tracked/pinned IDs.
@@ -378,6 +406,8 @@ def _slice_meta(
             for tid in slice_data.vocab_fragment
             if tid in alt_token
         }
+    if position_segments:
+        meta["segments"] = position_segments
     return meta
 
 
@@ -400,6 +430,7 @@ def write_slice_files(
     description: str,
     pinned_token_ids: set[int] | None = None,
     alt_token: dict[int, str] | None = None,
+    position_segments: list[dict[str, object]] | None = None,
 ) -> None:
     """Write the sidecar files a ``mode="fetch"`` page reads: ``meta.json``,
     ``slice.bin``, and one ``ranks/{token_id}.bin`` (gzip'd ``[seq_len,
@@ -410,7 +441,13 @@ def write_slice_files(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = _slice_meta(
-        slice_data, prompt, title, description, pinned_token_ids, alt_token
+        slice_data,
+        prompt,
+        title,
+        description,
+        pinned_token_ids,
+        alt_token,
+        position_segments,
     )
     (out_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
@@ -435,6 +472,7 @@ def build_page(
     mode: PageMode = "embed",
     out_dir: str | Path | None = None,
     alt_token: dict[int, str] | None = None,
+    position_segments: list[dict[str, object]] | None = None,
 ) -> tuple[str, int, int]:
     """Render ``slice_data`` into an HTML page.
 
@@ -463,7 +501,13 @@ def build_page(
     if pinned_token_ids is None:
         pinned_token_ids = set(slice_data.pinned_token_ids)
     meta = _slice_meta(
-        slice_data, prompt, title, description, pinned_token_ids, alt_token
+        slice_data,
+        prompt,
+        title,
+        description,
+        pinned_token_ids,
+        alt_token,
+        position_segments,
     )
     bootstrap: dict
     raw_bytes = payload_bytes = 0
@@ -497,6 +541,7 @@ def build_page(
             description=description,
             pinned_token_ids=pinned_token_ids,
             alt_token=alt_token,
+            position_segments=position_segments,
         )
         bootstrap = {"mode": "fetch"}
         payload_bytes = (Path(out_dir) / "slice.bin").stat().st_size

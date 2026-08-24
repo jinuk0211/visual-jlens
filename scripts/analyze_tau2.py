@@ -8,6 +8,7 @@ import csv
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -515,6 +516,75 @@ def _decode_ids(tokenizer: Any, token_ids: list[int] | tuple[int, ...]) -> list[
     ]
 
 
+def _visualization_segments(replay: ReplayedResponse) -> list[dict[str, Any]]:
+    """Build semantic overlays for the full request-plus-response viewer."""
+    total_tokens = len(replay.response.token_ids)
+    observation = next(
+        (
+            boundary
+            for boundary in replay.boundaries
+            if boundary.name == "observation" and boundary.context == "request"
+        ),
+        None,
+    )
+    assistant_start = (
+        min(total_tokens, observation.position + 1)
+        if observation is not None
+        else total_tokens
+    )
+    segments: list[dict[str, Any]] = []
+    if assistant_start:
+        segments.append(
+            {
+                "label": "request context + tool schema",
+                "kind": "request",
+                "start": 0,
+                "end": assistant_start,
+            }
+        )
+    if assistant_start < total_tokens:
+        segments.append(
+            {
+                "label": "current assistant response",
+                "kind": "assistant",
+                "start": assistant_start,
+                "end": total_tokens,
+            }
+        )
+    for boundary in replay.boundaries:
+        if 0 <= boundary.position < total_tokens:
+            label = boundary.name
+            if boundary.label:
+                label = f"{label}: {boundary.label}"
+            segments.append(
+                {
+                    "label": label,
+                    "kind": f"boundary-{boundary.name}",
+                    "start": boundary.position,
+                    "end": boundary.position + 1,
+                }
+            )
+    for span in replay.generated_spans:
+        segments.append(
+            {
+                "label": span.label,
+                "kind": span.kind.replace("_", "-"),
+                "start": span.start,
+                "end": span.end,
+            }
+        )
+    return segments
+
+
+def _generated_token_ids(replay: ReplayedResponse) -> set[int]:
+    """Tokens that need complete rank files in the interactive viewer."""
+    return {
+        int(token_id)
+        for span in replay.generated_spans
+        for token_id in span.token_ids
+    }
+
+
 def _boundary_rows(
     selected: SelectedCall,
     *,
@@ -582,6 +652,7 @@ def score_semantic_boundaries(
     enable_thinking: bool,
     layer_stride: int,
     max_seq_len: int,
+    top_k: int = 10,
 ) -> tuple[list[dict[str, Any]], ReplayedResponse]:
     """Read out observation, decision, tool, argument, and update boundaries."""
     replay = render_actual_response(
@@ -607,6 +678,7 @@ def score_semantic_boundaries(
             context_call_id=_call_id(selected.call),
             layers=layers,
             max_seq_len=max_seq_len,
+            top_k=top_k,
         )
     )
     rows.extend(
@@ -619,6 +691,7 @@ def score_semantic_boundaries(
             context_call_id=_call_id(selected.call),
             layers=layers,
             max_seq_len=max_seq_len,
+            top_k=top_k,
         )
     )
     if selected.next_call is not None:
@@ -648,6 +721,7 @@ def score_semantic_boundaries(
                 context_call_id=_call_id(selected.next_call),
                 layers=layers,
                 max_seq_len=max_seq_len,
+                top_k=top_k,
             )
         )
     return rows, replay
@@ -722,24 +796,42 @@ def write_visualization(
     pinned_token_ids: set[int],
     enable_thinking: bool,
     layer_stride: int,
+    top_k: int,
     last_n_tokens: int | None,
     max_seq_len: int,
-) -> Path:
+    position_chunk_size: int,
+    max_tracked: int | None,
+) -> dict[str, Any]:
     """Write the interactive slice including the logged assistant response."""
     del enable_thinking
     rendered = replay.response
+    segments = _visualization_segments(replay)
     exact_model = ExactInputModel(model, rendered.token_ids)
     slice_data = compute_slice(
         exact_model,
         lens,
         rendered.text,
-        top_n=5,
-        max_tracked=32,
+        top_n=top_k,
+        max_tracked=max_tracked,
         pinned_token_ids=pinned_token_ids,
         layer_stride=layer_stride,
         last_n_tokens=last_n_tokens,
         max_seq_len=max_seq_len,
+        mask_display=False,
+        position_chunk_size=position_chunk_size,
     )
+    expected_positions = (
+        len(rendered.token_ids)
+        if last_n_tokens is None
+        else min(last_n_tokens, len(rendered.token_ids))
+    )
+    if slice_data.seq_len != expected_positions:
+        raise AssertionError(
+            f"viewer contains {slice_data.seq_len} positions, expected "
+            f"{expected_positions}"
+        )
+    if model.n_layers - 1 not in slice_data.layers:
+        raise AssertionError("viewer does not contain the model final layer")
     page, _, _ = build_page(
         slice_data,
         rendered.text,
@@ -755,10 +847,48 @@ def write_visualization(
         pinned_token_ids=pinned_token_ids,
         mode="fetch",
         out_dir=output_dir,
+        position_segments=segments,
     )
     html_path = output_dir / "index.html"
     html_path.write_text(page, encoding="utf-8")
-    return html_path
+    raw_bytes = (
+        slice_data.top_ids.nbytes
+        + slice_data.top_ranks.nbytes
+        + slice_data.rank_tensor.nbytes
+    )
+    payload_bytes = sum(path.stat().st_size for path in output_dir.rglob("*.bin"))
+    completion_start = next(
+        (
+            segment["start"]
+            for segment in segments
+            if segment["kind"] == "assistant"
+        ),
+        len(rendered.token_ids),
+    )
+    record = {
+        **_analysis_metadata(selected),
+        "token_source": "reconstructed-token-ids",
+        "request_tokens": completion_start,
+        "completion_tokens": len(rendered.token_ids) - completion_start,
+        "total_tokens": len(rendered.token_ids),
+        "rendered_positions": slice_data.seq_len,
+        "all_tokens": last_n_tokens is None,
+        "context_offset": slice_data.ctx_offset,
+        "layers": slice_data.layers,
+        "top_k": top_k,
+        "position_chunk_size": position_chunk_size,
+        "max_tracked": max_tracked,
+        "tracked_tokens": len(slice_data.tracked_token_ids),
+        "segments": segments,
+        "raw_grid_bytes": raw_bytes,
+        "compressed_grid_bytes": payload_bytes,
+        "log_path": str(selected.call.path.resolve()),
+        "visualization": str(html_path.resolve()),
+    }
+    (output_dir / "analysis.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return record
 
 
 SCORE_FIELDS = [
@@ -856,16 +986,59 @@ def _write_rows(
         writer.writerows(rows)
 
 
-def _load_model_and_lens(args: argparse.Namespace) -> tuple[Any, Any, Any]:
+def write_index(output_dir: Path, entries: list[dict[str, Any]]) -> Path:
+    """Write the filterable full-trajectory catalog used by ToolAlignBench."""
+    data = json.dumps(entries, ensure_ascii=False).replace("</", "<\\/")
+    html = """<!doctype html><html lang="en"><meta charset="utf-8">
+<title>tau2 Full-Trajectory JLens</title>
+<style>
+body{font:14px system-ui;margin:24px;color:#172033;background:#f7f8fb}h1{margin:0 0 6px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}select{padding:6px;border:1px solid #ccd1da;border-radius:6px;background:white}
+table{border-collapse:collapse;width:100%;background:white}th,td{padding:7px;border-bottom:1px solid #e5e7eb;text-align:left}
+th{position:sticky;top:0;background:#eef1f6}a{color:#155eef}.muted{color:#667085}.error{color:#b42318}
+</style><h1>tau2 Full-Trajectory JLens</h1>
+<div class="muted">Every token position is retained by default. Select a call to inspect its position × layer grid.</div>
+<div class="muted" id="count"></div><div class="filters" id="filters"></div>
+<table><thead><tr><th>task</th><th>outcome</th><th>simulation</th><th>call</th><th>t−fail</th><th>reward</th><th>tokens</th><th>status</th><th>viewer</th></tr></thead><tbody id="rows"></tbody></table>
+<script>const data=__DATA__;const fields=['task_id','outcome','simulation_id','relative_to_failure','status'];const selected={};
+const filters=document.getElementById('filters');for(const f of fields){const s=document.createElement('select');s.innerHTML='<option value="">all '+f+'</option>'+[...new Set(data.map(x=>String(x[f]??'')))].sort().map(v=>`<option>${v}</option>`).join('');s.onchange=()=>{selected[f]=s.value;render()};filters.appendChild(s)}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function render(){const shown=data.filter(x=>fields.every(f=>!selected[f]||String(x[f]??'')===selected[f]));document.getElementById('count').textContent=`${shown.length} call(s)`;document.getElementById('rows').innerHTML=shown.map(x=>`<tr><td>${esc(x.task_id)}</td><td>${esc(x.outcome)}</td><td>${esc(x.simulation_id)}</td><td>${esc(x.call_id)}</td><td>${esc(x.relative_to_failure)}</td><td>${esc(x.reward)}</td><td>${esc(x.total_tokens)}</td><td class="${x.status==='error'?'error':''}">${esc(x.status)}</td><td>${x.href?`<a href="${encodeURI(x.href)}">open</a>`:esc(x.error||'—')}</td></tr>`).join('')}render();</script></html>"""
+    path = output_dir / "index.html"
+    path.write_text(html.replace("__DATA__", data), encoding="utf-8")
+    return path
+
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _resolve_dtype(requested: str) -> Any:
+    if requested == "float16":
+        return torch.float16
+    if requested == "bfloat16":
+        return torch.bfloat16
+    if requested != "auto":
+        raise ValueError(f"unknown dtype {requested!r}")
+    major, _minor = torch.cuda.get_device_capability()
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
+def _load_model_and_lens(
+    args: argparse.Namespace,
+) -> tuple[Any, Any, Any, dict[str, Any]]:
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for Qwen3-8B analysis")
+        raise RuntimeError("CUDA is required for full-trajectory JLens analysis")
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    dtype = _resolve_dtype(args.dtype)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.model_revision)
     hf_model = AutoModelForCausalLM.from_pretrained(
         args.model,
         revision=args.model_revision,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         attn_implementation=args.attn_implementation,
         low_cpu_mem_usage=True,
     ).cuda()
@@ -879,7 +1052,20 @@ def _load_model_and_lens(args: argparse.Namespace) -> tuple[Any, Any, Any]:
         raise ValueError(
             f"lens d_model={lens.d_model} does not match model d_model={model.d_model}"
         )
-    return hf_model, model, lens
+    if not lens.source_layers:
+        raise ValueError("downloaded lens contains no source layers")
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    major, minor = torch.cuda.get_device_capability()
+    gpu = {
+        "device": torch.cuda.get_device_name(),
+        "capability": f"{major}.{minor}",
+        "free_vram_gib": round(free_bytes / 2**30, 2),
+        "total_vram_gib": round(total_bytes / 2**30, 2),
+        "dtype": str(dtype).replace("torch.", ""),
+        "model_d_model": model.d_model,
+        "lens_d_model": lens.d_model,
+    }
+    return hf_model, model, lens, gpu
 
 
 def _parse_event_before(value: str) -> int | None:
@@ -894,7 +1080,7 @@ def _parse_event_before(value: str) -> int | None:
     return parsed
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
@@ -941,25 +1127,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--layer-stride", type=int, default=4)
     parser.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="top Jacobian-lens tokens stored per position/layer in the HTML grid",
+    )
+    parser.add_argument(
         "--last-n-tokens",
         type=int,
-        default=96,
-        help="HTML slice width; 0 renders all tokens (boundary CSV is unaffected)",
+        default=0,
+        help="HTML slice width; default 0 analyzes every token position",
+    )
+    parser.add_argument(
+        "--position-chunk-size",
+        type=int,
+        default=128,
+        help="positions unembedded together; chunking retains every position",
+    )
+    parser.add_argument(
+        "--max-tracked",
+        type=int,
+        help="cap frequent top-K token rank files; default tracks every top-K token",
     )
     parser.add_argument("--max-seq-len", type=int, default=32768)
     parser.add_argument("--no-html", action="store_true")
     parser.add_argument(
+        "--dtype", choices=("auto", "float16", "bfloat16"), default="auto"
+    )
+    parser.add_argument(
         "--attn-implementation", choices=("sdpa", "eager"), default="sdpa"
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> Path:
+    args = parse_args(argv)
     if args.event_after < 0:
         raise ValueError("--event-after must be non-negative")
+    if args.top_k < 1 or args.layer_stride < 1:
+        raise ValueError("--top-k and --layer-stride must be positive")
     if args.last_n_tokens < 0:
         raise ValueError("--last-n-tokens must be non-negative")
+    if args.position_chunk_size < 1 or args.max_seq_len < 1:
+        raise ValueError("--position-chunk-size and --max-seq-len must be positive")
+    if args.max_tracked is not None and args.max_tracked < 0:
+        raise ValueError("--max-tracked must be non-negative")
     output_dir = args.output_dir or args.run_dir / "jlens-analysis"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -975,74 +1187,133 @@ def main() -> None:
         allow_review_labels=args.allow_review_labels,
         limit=args.limit,
     )
-    manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    manifest.update(
+        {
+            "schema": "Tau2JLensManifestV1",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "inspect_only" if args.inspect_only else "running",
+            "model": {
+                "id": args.model,
+                "revision": args.model_revision,
+                "dtype": args.dtype,
+                "enable_thinking": args.enable_thinking,
+            },
+            "lens": {
+                "repo": args.lens_repo,
+                "revision": args.lens_revision,
+                "file": args.lens_file,
+            },
+            "visualization": {
+                "enabled": not args.no_html,
+                "all_tokens": args.last_n_tokens == 0,
+                "last_n_tokens": args.last_n_tokens or None,
+                "top_k": args.top_k,
+                "layer_stride": args.layer_stride,
+                "position_chunk_size": args.position_chunk_size,
+                "max_tracked": args.max_tracked,
+                "max_seq_len": args.max_seq_len,
+            },
+            "entries": [],
+        }
     )
+    manifest_path = output_dir / "manifest.json"
+    _write_manifest(manifest_path, manifest)
     summary = manifest["summary"]
     print(
         f"Selected {summary['selected_calls']} agent calls from "
         f"{summary['selected_cases']} cases; manifest: {manifest_path}"
     )
     if args.inspect_only:
-        return
+        write_index(output_dir, [])
+        return output_dir
     if not selected_calls:
-        raise RuntimeError(
+        error = (
             "no agent logs selected; rerun tau2 with --verbose-logs "
             "--llm-log-mode all and check the run directory"
         )
+        manifest.update({"status": "error", "error": error})
+        _write_manifest(manifest_path, manifest)
+        raise RuntimeError(error)
 
-    _, model, lens = _load_model_and_lens(args)
-    all_rows: list[dict[str, Any]] = []
-    all_boundary_rows: list[dict[str, Any]] = []
-    all_generated_span_rows: list[dict[str, Any]] = []
-    report: list[dict[str, Any]] = []
-    for index, selected in enumerate(selected_calls, start=1):
-        label = (
-            f"task={selected.case.task_id} sim={selected.case.simulation_id} "
-            f"call={_call_id(selected.call)}"
-        )
-        print(f"[{index}/{len(selected_calls)}] {label}")
-        entry: dict[str, Any] = {"label": label, "status": "ok"}
-        try:
-            boundary_rows, replay = score_semantic_boundaries(
-                selected,
-                model=model,
-                lens=lens,
-                enable_thinking=args.enable_thinking,
-                layer_stride=args.layer_stride,
-                max_seq_len=args.max_seq_len,
+    try:
+        _, model, lens, gpu = _load_model_and_lens(args)
+        manifest["gpu"] = gpu
+        _write_manifest(manifest_path, manifest)
+        all_rows: list[dict[str, Any]] = []
+        all_boundary_rows: list[dict[str, Any]] = []
+        all_generated_span_rows: list[dict[str, Any]] = []
+        report: list[dict[str, Any]] = []
+        for index, selected in enumerate(selected_calls, start=1):
+            label = (
+                f"task={selected.case.task_id} sim={selected.case.simulation_id} "
+                f"call={_call_id(selected.call)}"
             )
-            generated_span_rows = score_generated_spans(
-                selected,
-                replay,
-                model=model,
-                lens=lens,
-                layer_stride=args.layer_stride,
-                max_seq_len=args.max_seq_len,
-            )
-            all_boundary_rows.extend(boundary_rows)
-            all_generated_span_rows.extend(generated_span_rows)
-            entry["boundary_rows"] = len(boundary_rows)
-            entry["generated_span_rows"] = len(generated_span_rows)
-            rows, pinned = score_call(
-                selected,
-                model=model,
-                lens=lens,
-                enable_thinking=args.enable_thinking,
-                layer_stride=args.layer_stride,
-                max_seq_len=args.max_seq_len,
-            )
-            all_rows.extend(rows)
-            entry["score_rows"] = len(rows)
-            if not args.no_html:
-                call_dir = output_dir / (
-                    f"task_{_safe_name(selected.case.task_id)}__"
-                    f"sim_{_safe_name(selected.case.simulation_id)}__"
-                    f"call_{_safe_name(_call_id(selected.call))}"
+            print(f"[{index}/{len(selected_calls)}] {label}")
+            entry: dict[str, Any] = {
+                **_analysis_metadata(selected),
+                "label": label,
+                "status": "ok",
+            }
+            try:
+                boundary_rows, replay = score_semantic_boundaries(
+                    selected,
+                    model=model,
+                    lens=lens,
+                    enable_thinking=args.enable_thinking,
+                    layer_stride=args.layer_stride,
+                    max_seq_len=args.max_seq_len,
+                    top_k=args.top_k,
                 )
-                entry["visualization"] = str(
-                    write_visualization(
+                segments = _visualization_segments(replay)
+                completion_start = next(
+                    (
+                        segment["start"]
+                        for segment in segments
+                        if segment["kind"] == "assistant"
+                    ),
+                    len(replay.response.token_ids),
+                )
+                entry.update(
+                    {
+                        "token_source": "reconstructed-token-ids",
+                        "request_tokens": completion_start,
+                        "completion_tokens": (
+                            len(replay.response.token_ids) - completion_start
+                        ),
+                        "total_tokens": len(replay.response.token_ids),
+                        "segments": segments,
+                    }
+                )
+                generated_span_rows = score_generated_spans(
+                    selected,
+                    replay,
+                    model=model,
+                    lens=lens,
+                    layer_stride=args.layer_stride,
+                    max_seq_len=args.max_seq_len,
+                )
+                all_boundary_rows.extend(boundary_rows)
+                all_generated_span_rows.extend(generated_span_rows)
+                entry["boundary_rows"] = len(boundary_rows)
+                entry["generated_span_rows"] = len(generated_span_rows)
+                rows, pinned = score_call(
+                    selected,
+                    model=model,
+                    lens=lens,
+                    enable_thinking=args.enable_thinking,
+                    layer_stride=args.layer_stride,
+                    max_seq_len=args.max_seq_len,
+                )
+                pinned.update(_generated_token_ids(replay))
+                all_rows.extend(rows)
+                entry["score_rows"] = len(rows)
+                if not args.no_html:
+                    call_dir = output_dir / (
+                        f"task_{_safe_name(selected.case.task_id)}__"
+                        f"sim_{_safe_name(selected.case.simulation_id)}__"
+                        f"call_{_safe_name(_call_id(selected.call))}"
+                    )
+                    visualization = write_visualization(
                         selected,
                         model=model,
                         lens=lens,
@@ -1051,39 +1322,76 @@ def main() -> None:
                         pinned_token_ids=pinned,
                         enable_thinking=args.enable_thinking,
                         layer_stride=args.layer_stride,
+                        top_k=args.top_k,
                         last_n_tokens=(
                             None if args.last_n_tokens == 0 else args.last_n_tokens
                         ),
                         max_seq_len=args.max_seq_len,
+                        position_chunk_size=args.position_chunk_size,
+                        max_tracked=args.max_tracked,
                     )
-                )
-        except (RuntimeError, TypeError, ValueError) as exc:
-            entry["status"] = "error"
-            entry["error"] = str(exc)
-            print(f"  error: {exc}")
-        report.append(entry)
+                    entry.update(visualization)
+                    entry["href"] = (call_dir / "index.html").relative_to(
+                        output_dir
+                    ).as_posix()
+            except (AssertionError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                entry["status"] = "error"
+                entry["error"] = str(exc)
+                print(f"  error: {exc}")
+            report.append(entry)
+            manifest["entries"] = report
+            _write_manifest(manifest_path, manifest)
 
-    scores_path = output_dir / "tool_scores.csv"
-    _write_scores(scores_path, all_rows)
-    boundary_path = output_dir / "semantic_boundary_readouts.csv"
-    _write_rows(boundary_path, all_boundary_rows, BOUNDARY_FIELDS)
-    generated_span_path = output_dir / "generated_span_scores.csv"
-    _write_rows(
-        generated_span_path, all_generated_span_rows, GENERATED_SPAN_FIELDS
-    )
-    report_path = output_dir / "analysis_report.json"
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print(f"Wrote {len(all_rows)} score rows to {scores_path}")
-    print(
-        f"Wrote {len(all_boundary_rows)} semantic-boundary rows to {boundary_path}"
-    )
-    print(
-        f"Wrote {len(all_generated_span_rows)} generated-span rows to "
-        f"{generated_span_path}"
-    )
-    print(f"Per-call status: {report_path}")
+        scores_path = output_dir / "tool_scores.csv"
+        _write_scores(scores_path, all_rows)
+        boundary_path = output_dir / "semantic_boundary_readouts.csv"
+        _write_rows(boundary_path, all_boundary_rows, BOUNDARY_FIELDS)
+        generated_span_path = output_dir / "generated_span_scores.csv"
+        _write_rows(
+            generated_span_path, all_generated_span_rows, GENERATED_SPAN_FIELDS
+        )
+        report_path = output_dir / "analysis_report.json"
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        index_path = write_index(output_dir, report)
+        error_count = sum(entry["status"] == "error" for entry in report)
+        manifest.update(
+            {
+                "status": "complete_with_errors" if error_count else "complete",
+                "outputs": {
+                    "index": str(index_path.resolve()),
+                    "analysis_report": str(report_path.resolve()),
+                    "tool_scores": str(scores_path.resolve()),
+                    "semantic_boundary_readouts": str(boundary_path.resolve()),
+                    "generated_span_scores": str(generated_span_path.resolve()),
+                },
+                "output_summary": {
+                    "calls": len(report),
+                    "errors": error_count,
+                    "tool_score_rows": len(all_rows),
+                    "semantic_boundary_rows": len(all_boundary_rows),
+                    "generated_span_rows": len(all_generated_span_rows),
+                },
+            }
+        )
+        _write_manifest(manifest_path, manifest)
+        print(f"Wrote {len(all_rows)} score rows to {scores_path}")
+        print(
+            f"Wrote {len(all_boundary_rows)} semantic-boundary rows to "
+            f"{boundary_path}"
+        )
+        print(
+            f"Wrote {len(all_generated_span_rows)} generated-span rows to "
+            f"{generated_span_path}"
+        )
+        print(f"Full-trajectory catalog: {index_path}")
+        return output_dir
+    except Exception as exc:
+        manifest.update({"status": "error", "error": str(exc)})
+        _write_manifest(manifest_path, manifest)
+        raise
 
 
 if __name__ == "__main__":

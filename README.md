@@ -147,8 +147,8 @@ and argument tokens layer by layer.
 
 Reading a slice page:
 
-- Each cell shows the lens top-1 word at that (position, layer); the
-  superscript is its rank over the full vocabulary.
+- Each cell shows every saved top-K token at that (position, layer), labeled
+  `#1` through `#K` by full-vocabulary rank.
 - Click a cell to select a (position, layer) and pin its top-1 token; pinned
   tokens get rank-tracking charts and a rank heatmap.
 - The bottom row (`L = n_layers − 1`) is the model's actual output.

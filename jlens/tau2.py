@@ -670,12 +670,45 @@ def discover_agent_calls(run_dir: str | Path, case: Tau2Case) -> list[LoggedCall
 
 
 def normalize_messages(messages: Sequence[Mapping[str, Any]]) -> list[JSONDict]:
-    """Undo tau2's newline-splitting transformation without mutating input."""
+    """Restore logged messages to the shape expected by HF chat templates.
+
+    tau2 stores historical OpenAI-style tool arguments as JSON strings.  The
+    Qwen chat templates expect those arguments to be mappings and call
+    ``.items()`` on them, so replay must deserialize valid JSON objects first.
+    """
     normalized: list[JSONDict] = []
     for message in messages:
         value = copy.deepcopy(dict(message))
         if isinstance(value.get("content"), list):
             value["content"] = "\n".join(str(line) for line in value["content"])
+        # The GPT-OSS Harmony template checks for key presence before indexing
+        # ``tool_calls[0]`` and before searching assistant content.  OpenAI logs
+        # commonly retain these optional keys with null/empty values, which is
+        # semantically equivalent to omitting them but crashes that template.
+        if value.get("role") == "assistant":
+            if value.get("content") is None:
+                value.pop("content", None)
+            if value.get("thinking") is None:
+                value.pop("thinking", None)
+        tool_calls = value.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            value.pop("tool_calls", None)
+        else:
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                arguments = function.get("arguments")
+                if not isinstance(arguments, str):
+                    continue
+                try:
+                    parsed_arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed_arguments, Mapping):
+                    function["arguments"] = dict(parsed_arguments)
         normalized.append(value)
     return normalized
 
@@ -745,10 +778,9 @@ def _response_message(call: Mapping[str, Any]) -> JSONDict:
     response = call.get("response") or {}
     if not isinstance(response, Mapping):
         raise ValueError("logged response is not a JSON object")
-    message: JSONDict = {
-        "role": "assistant",
-        "content": copy.deepcopy(response.get("content")),
-    }
+    message: JSONDict = {"role": "assistant"}
+    if response.get("content") is not None:
+        message["content"] = copy.deepcopy(response["content"])
     normalized_calls: list[JSONDict] = []
     for tool_call in response.get("tool_calls") or []:
         if not isinstance(tool_call, Mapping):
@@ -777,16 +809,109 @@ def _response_message(call: Mapping[str, Any]) -> JSONDict:
     return message
 
 
-def _find_subsequence_or_none(
-    values: Sequence[int], target: Sequence[int], *, start: int = 0
-) -> int | None:
-    if not target:
-        return None
-    stop = len(values) - len(target) + 1
-    for index in range(start, stop):
-        if tuple(values[index : index + len(target)]) == tuple(target):
-            return index
-    return None
+def _token_offsets_for_ids(
+    tokenizer: Any, text: str, token_ids: Sequence[int]
+) -> list[tuple[int, int]]:
+    """Map exact rendered token IDs to character offsets without retokenizing.
+
+    A decoded BPE string can have more than one valid tokenization.  Fast
+    tokenizer offsets are safe only when their IDs equal the IDs returned by
+    ``apply_chat_template``; otherwise offsets are recovered from those exact
+    rendered IDs.
+    """
+    exact_ids = tuple(int(token_id) for token_id in token_ids)
+    try:
+        encoded = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        canonical_ids = _as_token_ids(encoded)
+        raw_offsets = encoded["offset_mapping"]
+        if hasattr(raw_offsets, "tolist"):
+            raw_offsets = raw_offsets.tolist()
+        if (
+            canonical_ids == exact_ids
+            and isinstance(raw_offsets, list)
+            and len(raw_offsets) == len(exact_ids)
+        ):
+            return [(int(pair[0]), int(pair[1])) for pair in raw_offsets]
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    decode_kwargs = {
+        "skip_special_tokens": False,
+        "clean_up_tokenization_spaces": False,
+    }
+    decoded = tokenizer.decode(exact_ids, **decode_kwargs)
+    if decoded != text:
+        raise ValueError(
+            "rendered token IDs do not decode to rendered text; refusing a "
+            "non-exact boundary mapping"
+        )
+
+    pieces = [tokenizer.decode([token_id], **decode_kwargs) for token_id in exact_ids]
+    if "".join(pieces) == text:
+        offsets: list[tuple[int, int]] = []
+        cursor = 0
+        for piece in pieces:
+            end = cursor + len(piece)
+            offsets.append((cursor, end))
+            cursor = end
+        return offsets
+
+    # Byte-level tokenizers can decode partial UTF-8 tokens as replacement
+    # characters.  Prefix decoding lets adjacent token bytes combine while
+    # retaining an exact, monotonic mapping to the rendered text.
+    boundaries = [0]
+    stable = 0
+    for end in range(1, len(exact_ids) + 1):
+        prefix = tokenizer.decode(exact_ids[:end], **decode_kwargs)
+        common = 0
+        limit = min(len(prefix), len(text))
+        while common < limit and prefix[common] == text[common]:
+            common += 1
+        if common < stable:
+            raise ValueError(
+                "rendered token decoder produced non-monotonic text prefixes; "
+                "refusing to guess token boundaries"
+            )
+        stable = common
+        boundaries.append(stable)
+    if boundaries[-1] != len(text):
+        raise ValueError(
+            "rendered token IDs could not be aligned exactly to rendered text"
+        )
+
+    offsets = []
+    for index in range(len(exact_ids)):
+        start, end = boundaries[index], boundaries[index + 1]
+        if start == end and start < len(text):
+            next_index = index + 2
+            while next_index < len(boundaries) and boundaries[next_index] <= start:
+                next_index += 1
+            if next_index < len(boundaries):
+                end = boundaries[next_index]
+        offsets.append((start, end))
+    return offsets
+
+
+def _token_span_for_chars(
+    offsets: Sequence[tuple[int, int]], char_start: int, char_end: int
+) -> tuple[int, int]:
+    """Return the exact tokens overlapping a non-empty character span."""
+    if char_start < 0 or char_end <= char_start:
+        raise ValueError(f"invalid character span [{char_start}, {char_end})")
+    hits = [
+        index
+        for index, (start, end) in enumerate(offsets)
+        if end > start and start < char_end and end > char_start
+    ]
+    if not hits:
+        raise ValueError(
+            f"character span [{char_start}, {char_end}) maps to no tokens"
+        )
+    return min(hits), max(hits) + 1
 
 
 def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
@@ -813,18 +938,16 @@ def _flatten_argument_values(value: Any, prefix: str = "") -> list[tuple[str, An
     return values
 
 
-def _argument_token_candidates(tokenizer: Any, value: Any) -> list[tuple[int, ...]]:
-    texts = [
-        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-        json.dumps(value, ensure_ascii=False),
-        str(value),
-    ]
-    candidates: list[tuple[int, ...]] = []
-    for text in dict.fromkeys(texts):
-        token_ids = _as_token_ids(tokenizer.encode(text, add_special_tokens=False))
-        if token_ids and token_ids not in candidates:
-            candidates.append(token_ids)
-    return candidates
+def _argument_text_candidates(value: Any) -> list[str]:
+    return list(
+        dict.fromkeys(
+            (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(value, ensure_ascii=False),
+                str(value),
+            )
+        )
+    )
 
 
 def render_actual_response(
@@ -874,19 +997,23 @@ def render_actual_response(
         ),
     ]
     spans: list[GeneratedSpan] = []
-    response_prefix = _common_prefix_length(observation.token_ids, response.token_ids)
-    search_start = max(0, response_prefix - 1)
+    response_char_prefix = _common_prefix_length(observation.text, response.text)
+    search_start = response_char_prefix
+    response_offsets = _token_offsets_for_ids(
+        tokenizer, response.text, response.token_ids
+    )
     response_calls = (call.get("response") or {}).get("tool_calls") or []
     for tool_index, tool_call in enumerate(response_calls):
         if not isinstance(tool_call, Mapping) or (name := _tool_name(tool_call)) is None:
             continue
-        name_ids = _as_token_ids(tokenizer.encode(name, add_special_tokens=False))
-        name_start = _find_subsequence_or_none(
-            response.token_ids, name_ids, start=search_start
-        )
-        if name_start is None:
+        name_char_start = response.text.find(name, search_start)
+        if name_char_start < 0:
             raise ValueError(f"tool name {name!r} was not found in logged response")
-        name_end = name_start + len(name_ids)
+        name_char_end = name_char_start + len(name)
+        name_start, name_end = _token_span_for_chars(
+            response_offsets, name_char_start, name_char_end
+        )
+        name_ids = tuple(response.token_ids[name_start:name_end])
         label = f"tool[{tool_index}]={name}"
         spans.append(
             GeneratedSpan(
@@ -906,20 +1033,21 @@ def render_actual_response(
             )
         )
 
-        argument_search = name_end
+        argument_search = name_char_end
         arguments = _tool_arguments(tool_call)
         for argument_label, value in _flatten_argument_values(arguments or {}):
-            match: tuple[int, tuple[int, ...]] | None = None
-            for token_ids in _argument_token_candidates(tokenizer, value):
-                start = _find_subsequence_or_none(
-                    response.token_ids, token_ids, start=argument_search
-                )
-                if start is not None and (match is None or start < match[0]):
-                    match = (start, token_ids)
+            match: tuple[int, int] | None = None
+            for candidate in _argument_text_candidates(value):
+                start = response.text.find(candidate, argument_search)
+                if start >= 0 and (match is None or start < match[0]):
+                    match = (start, start + len(candidate))
             if match is None:
                 continue
-            value_start, value_ids = match
-            value_end = value_start + len(value_ids)
+            value_char_start, value_char_end = match
+            value_start, value_end = _token_span_for_chars(
+                response_offsets, value_char_start, value_char_end
+            )
+            value_ids = tuple(response.token_ids[value_start:value_end])
             span_label = f"tool[{tool_index}].{argument_label}"
             spans.append(
                 GeneratedSpan(
@@ -938,8 +1066,8 @@ def render_actual_response(
                     label=span_label,
                 )
             )
-            argument_search = value_end
-        search_start = max(name_end, argument_search)
+            argument_search = value_char_end
+        search_start = max(name_char_end, argument_search)
 
     return ReplayedResponse(
         request=pre_response,
@@ -947,18 +1075,6 @@ def render_actual_response(
         boundaries=tuple(boundaries),
         generated_spans=tuple(spans),
     )
-
-
-def _find_subsequence(
-    values: Sequence[int], target: Sequence[int], *, start: int = 0
-) -> int:
-    if not target:
-        raise ValueError("cannot locate an empty token sequence")
-    stop = len(values) - len(target) + 1
-    for index in range(start, stop):
-        if tuple(values[index : index + len(target)]) == tuple(target):
-            return index
-    raise ValueError("tool name was not found in the rendered assistant tool call")
 
 
 def build_tool_candidate(
@@ -973,7 +1089,6 @@ def build_tool_candidate(
     messages = normalize_messages(request.get("messages") or [])
     candidate_message = {
         "role": "assistant",
-        "content": None,
         "tool_calls": [
             {
                 "type": "function",
@@ -994,16 +1109,23 @@ def build_tool_candidate(
     token_ids = _as_token_ids(
         tokenizer.apply_chat_template(**{**kwargs, "tokenize": True})
     )
-    name_token_ids = _as_token_ids(
-        tokenizer.encode(tool_name, add_special_tokens=False)
+    context = _render_messages(
+        tokenizer,
+        messages,
+        tools=request.get("tools") or [],
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
     )
-    base_length = len(
-        render_logged_call(tokenizer, call, enable_thinking=enable_thinking).token_ids
+    name_char_start = text.find(
+        tool_name, _common_prefix_length(context.text, text)
     )
-    name_start = _find_subsequence(
-        token_ids, name_token_ids, start=max(0, base_length - 1)
+    if name_char_start < 0:
+        raise ValueError("tool name was not found in the rendered assistant tool call")
+    offsets = _token_offsets_for_ids(tokenizer, text, token_ids)
+    name_start, name_end = _token_span_for_chars(
+        offsets, name_char_start, name_char_start + len(tool_name)
     )
-    name_end = name_start + len(name_token_ids)
+    name_token_ids = tuple(token_ids[name_start:name_end])
     prediction_positions = tuple(range(name_start - 1, name_end - 1))
     if prediction_positions[0] < 0:
         raise ValueError("tool name has no preceding token to score")
